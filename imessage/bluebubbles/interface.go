@@ -321,3 +321,16 @@ type ResolveIdentifierResponse struct {
 	Message string `json:"message"`
 	Data    Handle `json:"data"`
 }
+
+type AvailabilityResponse struct {
+	Data *struct {
+		Available *bool `json:"available"`
+	} `json:"data"`
+}
+
+type CreateChatRequest struct {
+	Addresses []string `json:"addresses"`
+	Message   string   `json:"message"`
+	Method    string   `json:"method"`
+	Service   string   `json:"service"`
+}

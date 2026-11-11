@@ -17,12 +17,16 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"maunium.net/go/maulogger/v2"
 	"maunium.net/go/mautrix"
@@ -45,6 +49,17 @@ type WebsocketCommandHandler struct {
 	syncProxyWaiting   int64
 
 	createRoomsForBackfillError error
+
+	groupCreateLock sync.Mutex
+	groupCreates    map[string]*groupCreateTransaction
+}
+
+type groupCreateTransaction struct {
+	digest    [sha256.Size]byte
+	done      chan struct{}
+	expiresAt time.Time
+	response  *StartDMResponse
+	err       error
 }
 
 func NewWebsocketCommandHandler(br *IMBridge) *WebsocketCommandHandler {
@@ -168,7 +183,9 @@ type StartDMRequest struct {
 type CreateGroupRequest struct {
 	Users []string `json:"users"`
 
-	AllowSMS bool `json:"allow_sms"`
+	AllowSMS      bool   `json:"allow_sms"`
+	Message       string `json:"message,omitempty"`
+	TransactionID string `json:"transaction_id,omitempty"`
 }
 
 type StartDMResponse struct {
@@ -185,7 +202,7 @@ func (mx *WebsocketCommandHandler) handleWSStartDM(cmd appservice.WebsocketComma
 	req.ActuallyStart = cmd.Command == "start_dm"
 	resp, err := mx.StartChat(req)
 	if err != nil {
-		mx.log.Errorfln("Error in %s handler: %v", cmd.Command, err)
+		mx.log.Errorfln("Error in %s handler", cmd.Command)
 		return false, err
 	} else {
 		return true, resp
@@ -194,43 +211,186 @@ func (mx *WebsocketCommandHandler) handleWSStartDM(cmd appservice.WebsocketComma
 
 func (mx *WebsocketCommandHandler) handleWSCreateGroup(cmd appservice.WebsocketCommand) (bool, interface{}) {
 	var req CreateGroupRequest
-	err := json.Unmarshal(cmd.Data, &req)
-	if err != nil {
+	if err := json.Unmarshal(cmd.Data, &req); err != nil {
 		return false, fmt.Errorf("failed to parse request: %w", err)
 	}
+	resp, err := mx.CreateGroup(req)
+	if err != nil {
+		return false, err
+	}
+	return true, resp
+}
+
+func copyStartDMResponse(resp *StartDMResponse) *StartDMResponse {
+	if resp == nil {
+		return nil
+	}
+	copy := *resp
+	return &copy
+}
+
+func (mx *WebsocketCommandHandler) CreateGroup(req CreateGroupRequest) (*StartDMResponse, error) {
+	if req.Message == "" {
+		return mx.createGroup(req)
+	} else if strings.TrimSpace(req.TransactionID) == "" {
+		return nil, fmt.Errorf("a stable transaction_id is required when sending a first message")
+	}
+	req.Users = append([]string(nil), req.Users...)
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode group request: %w", err)
+	}
+	digest := sha256.Sum256(payload)
+	mx.groupCreateLock.Lock()
+	now := time.Now()
+	for txnID, txn := range mx.groupCreates {
+		if !txn.expiresAt.IsZero() && !now.Before(txn.expiresAt) {
+			delete(mx.groupCreates, txnID)
+		}
+	}
+	if txn, ok := mx.groupCreates[req.TransactionID]; ok {
+		mx.groupCreateLock.Unlock()
+		if txn.digest != digest {
+			return nil, fmt.Errorf("transaction_id was already used with a different group request")
+		}
+		<-txn.done
+		return copyStartDMResponse(txn.response), txn.err
+	}
+	if len(mx.groupCreates) >= 256 {
+		mx.groupCreateLock.Unlock()
+		return nil, fmt.Errorf("group transaction cache is full; no message was sent for this new transaction")
+	}
+	if mx.groupCreates == nil {
+		mx.groupCreates = make(map[string]*groupCreateTransaction)
+	}
+	// shortcut: deduplication does not survive restart; clients must not blindly replay uncertain sends after restart.
+	txn := &groupCreateTransaction{digest: digest, done: make(chan struct{})}
+	mx.groupCreates[req.TransactionID] = txn
+	mx.groupCreateLock.Unlock()
+
+	resp, err := mx.createGroup(req)
+	mx.groupCreateLock.Lock()
+	txn.response, txn.err = copyStartDMResponse(resp), err
+	txn.expiresAt = time.Now().Add(24 * time.Hour)
+	close(txn.done)
+	mx.groupCreateLock.Unlock()
+	return resp, err
+}
+
+func validChatGUID(guid string, group bool) bool {
+	parts := strings.Split(guid, ";")
+	if len(parts) != 3 || strings.TrimSpace(parts[2]) == "" || strings.IndexFunc(parts[2], unicode.IsControl) >= 0 {
+		return false
+	}
+	if parts[0] != "iMessage" && parts[0] != "SMS" && parts[0] != "RCS" && parts[0] != "any" {
+		return false
+	}
+	return (group && parts[1] == "+") || (!group && parts[1] == "-")
+}
+
+func uncertainGroupError(err error) error {
+	return fmt.Errorf("%w; the group and first message may already exist: do not repeat blindly", err)
+}
+
+func (mx *WebsocketCommandHandler) createGroup(req CreateGroupRequest) (*StartDMResponse, error) {
+	messageAPI, withMessage := mx.bridge.IM.(imessage.GroupChatWithMessageAPI)
+	if withMessage && strings.TrimSpace(req.Message) == "" {
+		return nil, fmt.Errorf("this connector requires a nonempty first message; use create-group <recipient> <recipient> -- <first message>")
+	} else if !withMessage && req.Message != "" {
+		return nil, fmt.Errorf("this connector does not support creating a group with a first message; no message was sent")
+	}
+	if withMessage && (len(req.Users) < 2 || len(req.Users) > 31) {
+		return nil, fmt.Errorf("a group requires 2–31 distinct recipients")
+	}
 	guids := make([]string, len(req.Users))
+	seen := make(map[string]bool)
+	var hasSMS, hasEmail bool
 	for i, identifier := range req.Users {
-		if strings.HasPrefix(identifier, "iMessage;-;") || strings.HasPrefix(identifier, "SMS;-;") {
+		var err error
+		if !withMessage && (strings.HasPrefix(identifier, "iMessage;-;") || strings.HasPrefix(identifier, "SMS;-;")) {
 			guids[i] = identifier
 		} else {
 			guids[i], err = mx.bridge.IM.ResolveIdentifier(identifier)
 			if err != nil {
-				return false, fmt.Errorf("failed to resolve identifier %s: %w", identifier, err)
+				return nil, fmt.Errorf("failed to resolve group recipient %d: %w", i+1, err)
 			}
 		}
+		if withMessage {
+			if !validChatGUID(guids[i], false) {
+				return nil, fmt.Errorf("group recipient %d did not resolve to a valid direct identifier", i+1)
+			}
+			parsed := imessage.ParseIdentifier(guids[i])
+			if parsed.Service == "RCS" || strings.HasPrefix(identifier, "RCS;") {
+				return nil, fmt.Errorf("RCS group creation is not supported")
+			} else if parsed.Service != "iMessage" && parsed.Service != "SMS" {
+				return nil, fmt.Errorf("group recipient %d resolved to an unsupported service", i+1)
+			}
+			key := strings.ToLower(parsed.LocalID)
+			if seen[key] {
+				return nil, fmt.Errorf("group recipients must be distinct after normalization")
+			}
+			seen[key] = true
+			hasSMS = hasSMS || parsed.Service == "SMS"
+			hasEmail = hasEmail || !isNumber(parsed.LocalID)
+		}
 		if strings.HasPrefix(guids[i], "SMS;-;") && !req.AllowSMS {
-			return false, fmt.Errorf("%s is only available on SMS", identifier)
+			return nil, fmt.Errorf("group recipient %d is only available on SMS; explicit allow_sms consent is required", i+1)
 		}
 	}
-	mx.log.Debugfln("Creating group with guids %+v (resolved from identifiers %+v)", guids, req.Users)
-	createResp, err := mx.bridge.IM.CreateGroup(guids)
-	if err != nil {
-		return false, fmt.Errorf("failed to create group: %w", err)
+	if withMessage && hasSMS && hasEmail {
+		return nil, fmt.Errorf("SMS groups require phone numbers for all recipients; email addresses cannot be downgraded")
 	}
-	mx.log.Infofln("Created group %s (%s)", createResp.GUID, createResp.ThreadID)
+	var createResp *imessage.CreateGroupResponse
+	var err error
+	if withMessage {
+		createResp, err = messageAPI.CreateGroupWithMessage(guids, req.Message)
+	} else {
+		createResp, err = mx.bridge.IM.CreateGroup(guids)
+	}
+	if err != nil {
+		err = fmt.Errorf("failed to create group: %w", err)
+		if withMessage {
+			err = uncertainGroupError(err)
+		}
+		return nil, err
+	}
+	if createResp == nil || !validChatGUID(createResp.GUID, true) {
+		err = fmt.Errorf("connector returned an invalid group identifier")
+	} else if withMessage && ((hasSMS && !strings.HasPrefix(createResp.GUID, "SMS;+;")) || (!hasSMS && !strings.HasPrefix(createResp.GUID, "iMessage;+;"))) {
+		err = fmt.Errorf("connector returned an unexpected group service")
+	}
+	if err != nil {
+		if withMessage {
+			err = uncertainGroupError(err)
+		}
+		return nil, err
+	}
 	portal := mx.bridge.GetPortalByGUID(createResp.GUID)
-	portal.ThreadID = createResp.ThreadID
+	portal.roomCreateLock.Lock()
+	if !withMessage {
+		portal.ThreadID = createResp.ThreadID
+	} else if portal.ThreadID == "" {
+		err = portal.updateThreadID(createResp.ThreadID)
+	}
 	resp := StartDMResponse{
 		RoomID:      portal.MXID,
 		GUID:        createResp.GUID,
 		JustCreated: len(portal.MXID) == 0,
 	}
+	portal.roomCreateLock.Unlock()
+	if err != nil {
+		return nil, uncertainGroupError(fmt.Errorf("failed to persist conversation identity: %w", err))
+	}
 	err = portal.CreateMatrixRoom(nil, nil)
 	if err != nil {
-		return false, fmt.Errorf("failed to create Matrix room: %w", err)
+		err = fmt.Errorf("failed to create Matrix room: %w", err)
+		if withMessage {
+			err = uncertainGroupError(err)
+		}
+		return nil, err
 	}
-	resp.RoomID = portal.MXID
-	return true, &resp
+	resp.RoomID = portal.roomID()
+	return &resp, nil
 }
 
 func (mx *WebsocketCommandHandler) handleWSGetContacts(_ appservice.WebsocketCommand) (bool, interface{}) {
@@ -255,8 +415,11 @@ func (mx *WebsocketCommandHandler) handleWSUploadContacts(cmd appservice.Websock
 }
 
 func isNumber(number string) bool {
-	for _, char := range number {
-		if (char < '0' || char > '9') && char != '+' {
+	if number == "" || number == "+" {
+		return false
+	}
+	for i, char := range number {
+		if (char < '0' || char > '9') && !(i == 0 && char == '+') {
 			return false
 		}
 	}
@@ -266,16 +429,20 @@ func isNumber(number string) bool {
 func (mx *WebsocketCommandHandler) trackResolveIdentifier(actuallyTrack bool, identifier, status string) {
 	if actuallyTrack {
 		identifierType := "unknown"
-		if isNumber(identifierType) {
+		isStartupTarget := identifier == mx.bridge.Config.HackyStartupTest.Identifier
+		if validChatGUID(identifier, false) {
+			identifier = imessage.ParseIdentifier(identifier).LocalID
+		}
+		phone := strings.NewReplacer(" ", "", "-", "", "(", "", ")", "").Replace(strings.TrimPrefix(identifier, "tel:"))
+		if isNumber(phone) {
 			identifierType = "phone"
 		} else if strings.ContainsRune(identifier, '@') {
 			identifierType = "email"
 		}
 		Segment.Track("iMC resolve identifier", map[string]any{
 			"status":            status,
-			"is_startup_target": strconv.FormatBool(identifier == mx.bridge.Config.HackyStartupTest.Identifier),
+			"is_startup_target": strconv.FormatBool(isStartupTarget),
 			"identifier_type":   identifierType,
-			"tmp_identifier":    identifier,
 		})
 	}
 }
@@ -286,14 +453,18 @@ func (mx *WebsocketCommandHandler) StartChat(req StartDMRequest) (*StartDMRespon
 	var forced bool
 
 	if resp.GUID, err = mx.bridge.IM.ResolveIdentifier(req.Identifier); err != nil {
-		if req.Force && req.ActuallyStart {
-			mx.log.Debugfln("Failed to resolve identifier %s (%v), but forcing creation anyway", req.Identifier, err)
+		if req.Force && req.ActuallyStart && !errors.Is(err, imessage.ErrIdentifierResolution) {
+			mx.log.Debugln("Failed to resolve identifier, but forcing creation anyway")
 			resp.GUID = req.Identifier
 			forced = true
 		} else {
 			mx.trackResolveIdentifier(!req.ActuallyStart, req.Identifier, "fail")
 			return nil, fmt.Errorf("failed to resolve identifier: %w", err)
 		}
+	}
+	if !validChatGUID(resp.GUID, false) {
+		mx.trackResolveIdentifier(!req.ActuallyStart, req.Identifier, "fail")
+		return nil, fmt.Errorf("resolved identifier is not a valid direct chat GUID")
 	}
 	if parsed := imessage.ParseIdentifier(resp.GUID); parsed.Service == "SMS" && !isNumber(parsed.LocalID) {
 		mx.trackResolveIdentifier(!req.ActuallyStart, req.Identifier, "fail")

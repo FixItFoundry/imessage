@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"mime/multipart"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"os"
 	"strconv"
@@ -57,6 +58,9 @@ type blueBubbles struct {
 
 	contactsLastRefresh time.Time
 	contacts            []Contact
+	contactsLock        sync.Mutex
+	contactsLastFailure time.Time
+	contactsRefreshErr  error
 
 	bbRequestLock sync.Mutex
 
@@ -86,7 +90,9 @@ func (bb *blueBubbles) Start(readyCallback func()) error {
 
 	// Preload some caches
 	bb.usingPrivateAPI = bb.isPrivateAPI()
-	bb.RefreshContactList()
+	if err := bb.RefreshContactList(); err != nil {
+		bb.log.Warn().Err(err).Msg("Failed to preload contacts; message bridging will continue")
+	}
 
 	if err := bb.connectAndListen(); err != nil {
 		return err
@@ -118,7 +124,7 @@ func (bb *blueBubbles) connectAndListen() error {
 func (bb *blueBubbles) connectToWebSocket() (*websocket.Conn, error) {
 	ws, _, err := websocket.DefaultDialer.Dial(bb.wsUrl(), nil)
 	if err != nil {
-		return nil, err
+		return nil, safeRequestError(err)
 	}
 	err = ws.WriteMessage(websocket.TextMessage, []byte("40"))
 	if err != nil {
@@ -428,7 +434,7 @@ func (bb *blueBubbles) chatRoomUpdate(rawMessage json.RawMessage, eventName stri
 	}
 
 	if len(data.Chats) != 1 {
-		bb.log.Error().Interface("rawMessage", rawMessage).Str("event", eventName).Msg("Received chat update event without a chat to update")
+		return errors.New("chat update is missing a containing chat")
 	}
 
 	chat, err := bb.convertBBChatToiMessageChat(data.Chats[0])
@@ -860,12 +866,12 @@ func (bb *blueBubbles) GetChatsWithMessagesAfter(minDate time.Time) (resp []imes
 	return resp, nil
 }
 
-func (bb *blueBubbles) matchHandleToContact(address string) *Contact {
+func (bb *blueBubbles) matchHandleToContact(address string, contacts []Contact) *Contact {
 	var matchedContact *Contact
 
 	numericAddress := numericOnly(address)
 
-	for _, c := range bb.contacts {
+	for _, c := range contacts {
 		var contact *Contact
 
 		// extract only the numbers of every phone (removes `-` and `+`)
@@ -875,11 +881,14 @@ func (bb *blueBubbles) matchHandleToContact(address string) *Contact {
 		}
 
 		var emailStrings = convertEmails(c.Emails)
+		for i := range emailStrings {
+			emailStrings[i] = strings.ToLower(emailStrings[i])
+		}
 
 		var phoneStrings = convertPhones(c.PhoneNumbers)
 
 		// check for exact matches for either an email or phone
-		if strings.Contains(address, "@") && containsString(emailStrings, address) {
+		if strings.Contains(address, "@") && containsString(emailStrings, strings.ToLower(address)) {
 			contact = &Contact{} // Create a new instance
 			*contact = c
 		} else if containsString(phoneStrings, numericAddress) {
@@ -911,11 +920,15 @@ func (bb *blueBubbles) matchHandleToContact(address string) *Contact {
 }
 
 func (bb *blueBubbles) SearchContactList(input string) ([]*imessage.Contact, error) {
-	bb.log.Trace().Str("input", input).Msg("SearchContactList")
+	bb.log.Trace().Msg("SearchContactList")
+	contacts, err := bb.contactSnapshot(false, false)
+	if err != nil {
+		return nil, err
+	}
 
 	var matchedContacts []*imessage.Contact
 
-	for _, contact := range bb.contacts {
+	for _, contact := range contacts {
 
 		contactFields := []string{
 			strings.ToLower(contact.FirstName + " " + contact.LastName),
@@ -936,7 +949,10 @@ func (bb *blueBubbles) SearchContactList(input string) ([]*imessage.Contact, err
 		matches := fuzzy.Find(strings.ToLower(input), contactFields)
 
 		if len(matches) > 0 { //&& matches[0].Score >= 0
-			imessageContact, _ := bb.convertBBContactToiMessageContact(&contact)
+			imessageContact, err := bb.convertBBContactToiMessageContact(&contact)
+			if err != nil {
+				return nil, err
+			}
 			matchedContacts = append(matchedContacts, imessageContact)
 			continue
 		}
@@ -946,27 +962,32 @@ func (bb *blueBubbles) SearchContactList(input string) ([]*imessage.Contact, err
 }
 
 func (bb *blueBubbles) GetContactInfo(identifier string) (resp *imessage.Contact, err error) {
-	bb.log.Trace().Str("identifier", identifier).Msg("GetContactInfo")
-
-	contact := bb.matchHandleToContact(identifier)
-
-	bb.log.Trace().Str("identifier", identifier).Interface("contact", contact).Msg("GetContactInfo: found a contact")
+	bb.log.Trace().Msg("GetContactInfo")
+	contacts, err := bb.contactSnapshot(false, true)
+	if err != nil {
+		return nil, err
+	}
+	contact := bb.matchHandleToContact(identifier, contacts)
 
 	if contact != nil {
-		resp, _ = bb.convertBBContactToiMessageContact(contact)
-		return resp, nil
+		return bb.convertBBContactToiMessageContact(contact)
 
 	}
-	err = errors.New("no contacts found for address")
-	bb.log.Err(err).Str("identifier", identifier).Msg("No contacts matched address, aborting contact retrieval")
-	return nil, err
+	return nil, errors.New("no contacts found for address")
 }
 
 func (bb *blueBubbles) GetContactList() (resp []*imessage.Contact, err error) {
 	bb.log.Trace().Msg("GetContactList")
+	contacts, err := bb.contactSnapshot(false, false)
+	if err != nil {
+		return nil, err
+	}
 
-	for _, contact := range bb.contacts {
-		imessageContact, _ := bb.convertBBContactToiMessageContact(&contact)
+	for _, contact := range contacts {
+		imessageContact, err := bb.convertBBContactToiMessageContact(&contact)
+		if err != nil {
+			return nil, err
+		}
 		resp = append(resp, imessageContact)
 	}
 
@@ -974,22 +995,35 @@ func (bb *blueBubbles) GetContactList() (resp []*imessage.Contact, err error) {
 }
 
 func (bb *blueBubbles) RefreshContactList() error {
-	bb.log.Trace().Msg("refreshContactsList")
+	_, err := bb.contactSnapshot(true, false)
+	return err
+}
 
-	var contactResponse ContactResponse
+func (bb *blueBubbles) contactSnapshot(force, allowStale bool) ([]Contact, error) {
+	bb.contactsLock.Lock()
+	defer bb.contactsLock.Unlock()
 
-	err := bb.apiGet("/api/v1/contact", map[string]string{
-		"extraProperties": "avatar",
-	}, &contactResponse)
-	if err != nil {
-		return err
+	if force || bb.contactsRefreshErr != nil || time.Since(bb.contactsLastRefresh) >= 5*time.Minute {
+		if force || bb.contactsRefreshErr == nil || time.Since(bb.contactsLastFailure) >= 30*time.Second {
+			var response ContactResponse
+			err := bb.apiGet("/api/v1/contact", map[string]string{"extraProperties": "avatar"}, &response)
+			if err == nil && response.Data == nil {
+				err = errors.New("contact response is missing data")
+			}
+			bb.contactsRefreshErr = err
+			if err != nil {
+				bb.contactsLastFailure = time.Now()
+			} else {
+				// Published snapshots are immutable, so readers can use them after unlocking.
+				bb.contacts = response.Data
+				bb.contactsLastRefresh = time.Now()
+			}
+		}
 	}
-
-	// save contacts for later
-	bb.contacts = contactResponse.Data
-	bb.contactsLastRefresh = time.Now()
-
-	return nil
+	if bb.contactsRefreshErr != nil && (!allowStale || bb.contactsLastRefresh.IsZero()) {
+		return nil, bb.contactsRefreshErr
+	}
+	return bb.contacts, nil
 }
 
 func (bb *blueBubbles) getChatInfo(chatID string) (*ChatResponse, error) {
@@ -1090,7 +1124,7 @@ func (bb *blueBubbles) BackfillTaskChan() <-chan *imessage.BackfillTask {
 }
 
 func (bb *blueBubbles) SendMessage(chatID, text string, replyTo string, replyToPart int, richLink *imessage.RichLink, metadata imessage.MessageMetadata) (*imessage.SendResponse, error) {
-	bb.log.Trace().Str("chatID", chatID).Str("text", text).Str("replyTo", replyTo).Int("replyToPart", replyToPart).Any("richLink", richLink).Interface("metadata", metadata).Msg("SendMessage")
+	bb.log.Trace().Msg("SendMessage")
 
 	var method string
 	if bb.usingPrivateAPI {
@@ -1113,12 +1147,12 @@ func (bb *blueBubbles) SendMessage(chatID, text string, replyTo string, replyToP
 
 	err := bb.apiPost("/api/v1/message/text", request, &res)
 	if err != nil {
-		bb.log.Error().Any("response", res).Msg("Failure when sending message to BlueBubbles")
+		bb.log.Error().Err(err).Msg("Failure when sending message to BlueBubbles")
 		return nil, err
 	}
 
 	if res.Status != 200 {
-		bb.log.Error().Int64("statusCode", res.Status).Any("response", res).Msg("Failure when sending message to BlueBubbles")
+		bb.log.Error().Int64("statusCode", res.Status).Msg("Failure when sending message to BlueBubbles")
 
 		return nil, errors.New("could not send message")
 	}
@@ -1369,37 +1403,170 @@ func (bb *blueBubbles) SendTypingNotification(chatID string, typing bool) error 
 }
 
 func (bb *blueBubbles) ResolveIdentifier(address string) (string, error) {
-	bb.log.Trace().Str("address", address).Msg("ResolveIdentifier")
-
-	var identifierResponse ResolveIdentifierResponse
-
-	var handle = address
-	if !strings.Contains(address, "@") {
-		handle = "+" + numericOnly(address)
-	}
-
-	err := bb.apiGet(fmt.Sprintf("/api/v1/handle/%s", handle), nil, &identifierResponse)
+	bb.log.Trace().Msg("ResolveIdentifier")
+	guid, err := bb.resolveIdentifier(address)
 	if err != nil {
-		bb.log.Error().Any("response", identifierResponse).Str("address", address).Str("handle", handle).Msg("Failure when Resolving Identifier")
+		return "", fmt.Errorf("%w: %w", imessage.ErrIdentifierResolution, err)
+	}
+	return guid, nil
+}
+
+func normalizeRecipient(input string) (service, address string, err error) {
+	for _, r := range input {
+		if unicode.IsControl(r) {
+			return "", "", errors.New("recipient must not contain control characters")
+		}
+	}
+	if strings.Contains(input, ";") {
+		parts := strings.Split(input, ";")
+		if len(parts) != 3 || parts[1] != "-" || (parts[0] != "iMessage" && parts[0] != "SMS" && parts[0] != "RCS") {
+			return "", "", errors.New("recipient must be a direct iMessage, SMS or existing RCS identifier")
+		}
+		service, input = parts[0], parts[2]
+	}
+	input = strings.Trim(input, " ")
+	if strings.Contains(input, "@") {
+		// BlueBubbles slugifyAddress strips other characters, potentially changing the mailbox.
+		for _, r := range input {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '@' || r == '.' || r == '-') {
+				return "", "", errors.New("BlueBubbles cannot safely use this email address; only ASCII letters, digits, underscore, @, dot and hyphen are supported")
+			}
+		}
+		parsed, parseErr := mail.ParseAddress(input)
+		if parseErr != nil || parsed.Name != "" || parsed.Address != input || strings.ContainsAny(input, ";<>") {
+			return "", "", errors.New("recipient must be a plain email address")
+		}
+		if service == "SMS" || service == "RCS" {
+			return "", "", errors.New("SMS and RCS recipients must be international phone numbers")
+		}
+		return service, strings.ToLower(input), nil
+	}
+	if !strings.HasPrefix(input, "+") {
+		return "", "", errors.New("phone number must start with + and its country code")
+	}
+	var digits strings.Builder
+	for _, r := range input[1:] {
+		switch {
+		case r >= '0' && r <= '9':
+			digits.WriteRune(r)
+		case r == ' ' || r == '-' || r == '(' || r == ')':
+		default:
+			return "", "", errors.New("phone number must contain only ASCII digits and spaces, hyphens or parentheses")
+		}
+	}
+	number := digits.String()
+	if len(number) < 7 || len(number) > 15 || number[0] == '0' {
+		return "", "", errors.New("phone number must have 7–15 digits and a nonzero country code")
+	}
+	return service, "+" + number, nil
+}
+
+func (bb *blueBubbles) resolveIdentifier(input string) (string, error) {
+	service, address, err := normalizeRecipient(input)
+	if err != nil {
 		return "", err
 	}
-
-	if identifierResponse.Data.Service == "" || identifierResponse.Data.Address == "" {
-		bb.log.Warn().Any("response", identifierResponse).Str("address", address).Msg("No results found for provided identifier. Assuming 'iMessage' service.")
-		return "iMessage;-;" + handle, nil
+	if service == "SMS" {
+		return "SMS;-;" + address, nil
+	}
+	if bb.usingPrivateAPI && service != "RCS" {
+		var response AvailabilityResponse
+		if err := bb.apiGet("/api/v1/handle/availability/imessage", map[string]string{"address": address}, &response); err != nil {
+			return "", fmt.Errorf("could not verify iMessage availability: %w", err)
+		}
+		if response.Data == nil || response.Data.Available == nil {
+			return "", errors.New("iMessage availability response is missing a boolean result")
+		}
+		if *response.Data.Available {
+			return "iMessage;-;" + address, nil
+		}
+		if service == "iMessage" || strings.Contains(address, "@") {
+			return "", errors.New("recipient is not available on iMessage")
+		}
+		return "SMS;-;" + address, nil
 	}
 
-	return identifierResponse.Data.Service + ";-;" + identifierResponse.Data.Address, nil
+	var response ResolveIdentifierResponse
+	req, err := http.NewRequest(http.MethodGet, bb.apiURL("/api/v1/handle/"+address, nil), nil)
+	if err != nil {
+		return "", safeRequestError(err)
+	}
+	req.URL.RawPath = "/api/v1/handle/" + url.PathEscape(address)
+	if err := bb.doJSONRequest(req, &response); err != nil {
+		return "", fmt.Errorf("could not resolve stored recipient; enable Private API for live iMessage lookup: %w", err)
+	}
+	storedService, storedAddress, err := normalizeRecipient(response.Data.Service + ";-;" + response.Data.Address)
+	if err != nil || storedAddress != address || (service != "" && storedService != service) {
+		return "", errors.New("stored recipient identity is invalid or unresolved; enable Private API for live iMessage lookup")
+	}
+	return storedService + ";-;" + storedAddress, nil
 }
 
 func (bb *blueBubbles) PrepareDM(guid string) error {
-	bb.log.Trace().Str("guid", guid).Msg("PrepareDM")
+	bb.log.Trace().Msg("PrepareDM")
 	return nil
 }
 
 func (bb *blueBubbles) CreateGroup(users []string) (*imessage.CreateGroupResponse, error) {
-	bb.log.Trace().Interface("users", users).Msg("CreateGroup")
-	return nil, errors.ErrUnsupported
+	return nil, fmt.Errorf("%w: BlueBubbles requires a first message; use create-group with your message", errors.ErrUnsupported)
+}
+
+func (bb *blueBubbles) CreateGroupWithMessage(guids []string, message string) (*imessage.CreateGroupResponse, error) {
+	if !bb.usingPrivateAPI {
+		return nil, errors.New("group creation requires BlueBubbles Private API")
+	}
+	if strings.TrimSpace(message) == "" {
+		return nil, errors.New("group creation requires a nonempty first message")
+	}
+	if len(guids) < 2 || len(guids) > 31 {
+		return nil, errors.New("group creation requires 2–31 distinct recipients")
+	}
+	request := CreateChatRequest{Message: message, Method: "private-api", Service: "iMessage"}
+	seen := make(map[string]bool, len(guids))
+	for _, guid := range guids {
+		service, address, err := normalizeRecipient(guid)
+		if err != nil || service == "" || service == "RCS" {
+			return nil, errors.New("group participants must be direct iMessage or SMS identifiers, not RCS")
+		}
+		if seen[address] {
+			return nil, errors.New("group participants must be distinct after normalization")
+		}
+		seen[address] = true
+		if service == "SMS" {
+			// The shared handler resolves recipients and checks explicit SMS consent before this call.
+			request.Service = "SMS"
+		}
+		request.Addresses = append(request.Addresses, address)
+	}
+	if request.Service == "SMS" {
+		for _, address := range request.Addresses {
+			if strings.Contains(address, "@") {
+				return nil, errors.New("SMS groups cannot include email addresses")
+			}
+		}
+	}
+
+	var response ChatResponse
+	if err := bb.apiPost("/api/v1/chat/new", request, &response); err != nil {
+		return nil, fmt.Errorf("group/first message may already exist; do not repeat blindly: %w", err)
+	}
+	if response.Data == nil || !validChatGUID(response.Data.GUID, true) || strings.Split(response.Data.GUID, ";")[0] != request.Service {
+		return nil, errors.New("group/first message may already exist; do not repeat blindly: invalid group creation result or unexpected service")
+	}
+	return &imessage.CreateGroupResponse{GUID: response.Data.GUID, ThreadID: response.Data.GroupID}, nil
+}
+
+func validChatGUID(guid string, groupOnly bool) bool {
+	parts := strings.Split(guid, ";")
+	if len(parts) != 3 || strings.TrimSpace(parts[2]) == "" || (parts[1] != "+" && (groupOnly || parts[1] != "-")) {
+		return false
+	}
+	for _, r := range guid {
+		if unicode.IsControl(r) {
+			return false
+		}
+	}
+	return parts[0] == "iMessage" || parts[0] == "SMS" || parts[0] == "RCS" || parts[0] == "any"
 }
 
 // Helper functions
@@ -1407,7 +1574,7 @@ func (bb *blueBubbles) CreateGroup(users []string) (*imessage.CreateGroupRespons
 func (bb *blueBubbles) wsUrl() string {
 	u, err := url.Parse(strings.Replace(bb.bridge.GetConnectorConfig().BlueBubblesURL, "http", "ws", 1))
 	if err != nil {
-		bb.log.Error().Err(err).Msg("Error parsing BlueBubbles URL")
+		bb.log.Error().Msg("Error parsing BlueBubbles URL")
 		// TODO error handling for bad config
 		return ""
 	}
@@ -1428,12 +1595,13 @@ func (bb *blueBubbles) wsUrl() string {
 func (bb *blueBubbles) apiURL(path string, queryParams map[string]string) string {
 	u, err := url.Parse(bb.bridge.GetConnectorConfig().BlueBubblesURL)
 	if err != nil {
-		bb.log.Error().Err(err).Msg("Error parsing BlueBubbles URL")
+		bb.log.Error().Msg("Error parsing BlueBubbles URL")
 		// TODO error handling for bad config
 		return ""
 	}
 
 	u.Path = path
+	u.RawPath = ""
 
 	q := u.Query()
 	q.Add("password", bb.bridge.GetConnectorConfig().BlueBubblesPassword)
@@ -1450,29 +1618,11 @@ func (bb *blueBubbles) apiURL(path string, queryParams map[string]string) string
 }
 
 func (bb *blueBubbles) apiGet(path string, queryParams map[string]string, target interface{}) (err error) {
-	url := bb.apiURL(path, queryParams)
-
-	bb.bbRequestLock.Lock()
-	response, err := http.Get(url)
-	bb.bbRequestLock.Unlock()
+	req, err := http.NewRequest(http.MethodGet, bb.apiURL(path, queryParams), nil)
 	if err != nil {
-		bb.log.Error().Err(err).Msg("Error making GET request")
-		return err
+		return safeRequestError(err)
 	}
-	defer response.Body.Close()
-
-	responseBody, err := io.ReadAll(response.Body)
-	if err != nil {
-		bb.log.Error().Err(err).Msg("Error reading response body")
-		return err
-	}
-
-	if err := json.Unmarshal(responseBody, target); err != nil {
-		bb.log.Error().Err(err).Msg("Error unmarshalling response body")
-		return err
-	}
-
-	return nil
+	return bb.doJSONRequest(req, target)
 }
 
 func (bb *blueBubbles) apiPost(path string, payload interface{}, target interface{}) error {
@@ -1490,38 +1640,61 @@ func (bb *blueBubbles) apiRequest(method, path string, payload interface{}, targ
 	if payload != nil {
 		payloadJSON, err = json.Marshal(payload)
 		if err != nil {
-			bb.log.Error().Err(err).Msg("Error marshalling payload")
-			return err
+			return errors.New("could not encode BlueBubbles request")
 		}
 	}
 
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(payloadJSON))
 	if err != nil {
-		bb.log.Error().Err(err).Str("method", method).Msg("Error creating request")
-		return err
+		return safeRequestError(err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
+	return bb.doJSONRequest(req, target)
+}
+
+func safeRequestError(err error) error {
+	// URL/transport errors can contain credentials, addresses and query parameters.
+	if os.IsTimeout(err) {
+		return errors.New("BlueBubbles request timed out")
+	}
+	return errors.New("BlueBubbles request failed")
+}
+
+func (bb *blueBubbles) doJSONRequest(req *http.Request, target interface{}) error {
+	client := &http.Client{
+		Timeout: 45 * time.Second,
+		// A redirect must not replay a group creation/first-message POST.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	bb.bbRequestLock.Lock()
+	defer bb.bbRequestLock.Unlock()
 	response, err := client.Do(req)
-	bb.bbRequestLock.Unlock()
 	if err != nil {
-		bb.log.Error().Err(err).Str("method", method).Msg("Error making request")
-		return err
+		return safeRequestError(err)
 	}
 	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("BlueBubbles returned HTTP status %d", response.StatusCode)
+	}
 
 	responseBody, err := io.ReadAll(response.Body)
 	if err != nil {
-		bb.log.Error().Err(err).Msg("Error reading response body")
-		return err
+		return safeRequestError(err)
+	}
+	var envelope struct {
+		Status int `json:"status"`
+	}
+	if json.Unmarshal(responseBody, &envelope) != nil {
+		return errors.New("invalid BlueBubbles JSON response")
+	}
+	if envelope.Status != http.StatusOK {
+		return fmt.Errorf("BlueBubbles returned envelope status %d", envelope.Status)
 	}
 
 	if err := json.Unmarshal(responseBody, target); err != nil {
-		bb.log.Error().Err(err).Msg("Error unmarshalling response body")
-		return err
+		return errors.New("invalid BlueBubbles response data")
 	}
 
 	return nil
@@ -1564,6 +1737,7 @@ func (bb *blueBubbles) apiPostAsFormData(path string, formData map[string]interf
 	response, err := http.Post(url, writer.FormDataContentType(), &body)
 	bb.bbRequestLock.Unlock()
 	if err != nil {
+		err = safeRequestError(err)
 		bb.log.Error().Err(err).Msg("Error making POST request")
 		return err
 	}
@@ -1589,6 +1763,9 @@ func (bb *blueBubbles) convertBBContactToiMessageContact(bbContact *Contact) (*i
 	var convertedID string
 	var imageData []byte
 	var err error
+	if bbContact == nil {
+		return nil, errors.New("contact is missing data")
+	}
 
 	switch id := bbContact.ID.(type) {
 	case string:
@@ -1598,14 +1775,14 @@ func (bb *blueBubbles) convertBBContactToiMessageContact(bbContact *Contact) (*i
 		// id is a float, convert it to a string
 		convertedID = strconv.FormatFloat(id, 'f', -1, 64)
 	default:
-		bb.log.Error().Interface("id", id).Msg("Unknown type for contact ID")
-		convertedID = ""
+		return nil, errors.New("contact has an invalid ID type")
 	}
 
-	if *bbContact.Avatar != "" {
+	if bbContact.Avatar != nil && *bbContact.Avatar != "" {
 		imageData, err = base64.StdEncoding.DecodeString(*bbContact.Avatar)
 		if err != nil {
-			bb.log.Error().Err(err).Str("DisplayName", bbContact.DisplayName).Msg("Error decoding contact avatar")
+			imageData = nil
+			bb.log.Warn().Msg("Skipping malformed contact avatar")
 		}
 	}
 
@@ -1621,6 +1798,9 @@ func (bb *blueBubbles) convertBBContactToiMessageContact(bbContact *Contact) (*i
 }
 
 func (bb *blueBubbles) convertBBMessageToiMessage(bbMessage Message) (*imessage.Message, error) {
+	if len(bbMessage.Chats) != 1 || !validChatGUID(bbMessage.Chats[0].GUID, false) {
+		return nil, errors.New("message is missing a valid containing chat")
+	}
 
 	var message imessage.Message
 
@@ -1690,7 +1870,7 @@ func (bb *blueBubbles) convertBBMessageToiMessage(bbMessage Message) (*imessage.
 	for i, attachment := range bbMessage.Attachments {
 		attachment, err := bb.downloadAttachment(attachment.GUID)
 		if err != nil {
-			bb.log.Err(err).Str("attachmentGUID", attachment.GUID).Msg("Failed to download attachment")
+			bb.log.Err(err).Msg("Failed to download attachment")
 			continue
 		}
 
@@ -1708,7 +1888,7 @@ func (bb *blueBubbles) convertBBMessageToiMessage(bbMessage Message) (*imessage.
 	// TODO Richlinks
 	// message.RichLink =
 
-	message.ThreadID = bbMessage.ThreadOriginatorGUID
+	message.ThreadID = bbMessage.Chats[0].GroupID
 
 	return &message, nil
 }
@@ -1735,6 +1915,9 @@ func (bb *blueBubbles) convertBBTapbackToImessageTapback(associatedMessageType s
 }
 
 func (bb *blueBubbles) convertBBChatToiMessageChat(bbChat Chat) (*imessage.ChatInfo, error) {
+	if !validChatGUID(bbChat.GUID, false) {
+		return nil, errors.New("chat has an invalid identifier")
+	}
 	members := make([]string, len(bbChat.Participants))
 
 	for i, participant := range bbChat.Participants {
@@ -1766,6 +1949,7 @@ func (bb *blueBubbles) downloadAttachment(guid string) (attachment *imessage.Att
 
 	response, err := http.Get(url)
 	if err != nil {
+		err = safeRequestError(err)
 		bb.log.Error().Err(err).Msg("Error making GET request")
 		return nil, err
 	}

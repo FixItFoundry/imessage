@@ -19,6 +19,8 @@ package main
 import (
 	"fmt"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"go.mau.fi/mautrix-imessage/imessage"
 	"maunium.net/go/mautrix/bridge/commands"
@@ -39,6 +41,7 @@ func (br *IMBridge) RegisterCommands() {
 	proc := br.CommandProcessor.(*commands.Processor)
 	proc.AddHandlers(
 		cmdPM,
+		cmdCreateGroup,
 		cmdSearchContacts,
 		cmdRefreshContacts,
 	)
@@ -68,8 +71,6 @@ var cmdPM = &commands.FullHandler{
 }
 
 func fnPM(ce *WrappedCommandEvent) {
-	ce.Bridge.ZLog.Trace().Interface("args", ce.Args).Str("cmd", ce.Command).Msg("fnPM")
-
 	if len(ce.Args) == 0 {
 		ce.Reply("**Usage:** `pm <international phone number>` OR `pm <apple id email address>`")
 		return
@@ -88,6 +89,79 @@ func fnPM(ce *WrappedCommandEvent) {
 	}
 }
 
+var cmdCreateGroup = &commands.FullHandler{
+	Func: wrapCommand(fnCreateGroup),
+	Name: "create-group",
+	Help: commands.HelpMeta{
+		Section:     HelpSectionManagingPortals,
+		Description: "Creates a group and sends your first message to its recipients.",
+		Args:        "[--allow-sms] <recipient> <recipient> ... -- <first message>",
+	},
+	RequiresPortal: false,
+	RequiresLogin:  false,
+}
+
+func parseCreateGroupArgs(raw string) (CreateGroupRequest, error) {
+	var req CreateGroupRequest
+	for start := 0; start < len(raw); {
+		char, size := utf8.DecodeRuneInString(raw[start:])
+		if unicode.IsSpace(char) {
+			start += size
+			continue
+		}
+		end := start
+		for end < len(raw) {
+			char, size = utf8.DecodeRuneInString(raw[end:])
+			if unicode.IsSpace(char) {
+				break
+			}
+			end += size
+		}
+		if raw[start:end] != "--" {
+			start = end
+			continue
+		}
+		req.Users = strings.Fields(raw[:start])
+		if len(req.Users) > 0 && req.Users[0] == "--allow-sms" {
+			req.AllowSMS = true
+			req.Users = req.Users[1:]
+		}
+		for _, recipient := range req.Users {
+			if strings.HasPrefix(recipient, "--") {
+				return req, fmt.Errorf("--allow-sms is the only option and must be the first token")
+			}
+		}
+		if len(req.Users) < 2 || len(req.Users) > 31 {
+			return req, fmt.Errorf("provide 2–31 distinct recipients before the standalone -- delimiter")
+		}
+		req.Message = raw[end:]
+		if req.Message != "" {
+			_, size = utf8.DecodeRuneInString(req.Message)
+			req.Message = req.Message[size:]
+		}
+		if strings.TrimSpace(req.Message) == "" {
+			return req, fmt.Errorf("provide a nonempty first message after --; this message will be sent to the recipients")
+		}
+		return req, nil
+	}
+	return req, fmt.Errorf("a standalone -- delimiter is required before the first message")
+}
+
+func fnCreateGroup(ce *WrappedCommandEvent) {
+	req, err := parseCreateGroupArgs(ce.RawArgs)
+	if err != nil {
+		ce.Reply("%s\n\n**Usage:** `$cmdprefix create-group [--allow-sms] <recipient> <recipient> ... -- <first message>`\nThis sends the first message to the recipients.", err)
+		return
+	}
+	req.TransactionID = ce.EventID.String()
+	resp, err := ce.Bridge.WebsocketHandler.CreateGroup(req)
+	if err != nil {
+		ce.Reply("Failed to create group: %s", err)
+	} else {
+		ce.Reply("Created group portal [%s](%s) and sent your first message.", resp.RoomID, resp.RoomID.URI(ce.Bridge.Config.Homeserver.Domain).MatrixToURL())
+	}
+}
+
 var cmdSearchContacts = &commands.FullHandler{
 	Func: wrapCommand(fnSearchContacts),
 	Name: "search-contacts",
@@ -100,8 +174,6 @@ var cmdSearchContacts = &commands.FullHandler{
 }
 
 func fnSearchContacts(ce *WrappedCommandEvent) {
-	ce.Bridge.ZLog.Trace().Interface("args", ce.Args).Str("cmd", ce.Command).Msg("fnSearchContacts")
-
 	if len(ce.Args) == 0 {
 		ce.Reply("**Usage:** `search-contacts <search terms>`")
 		return
@@ -165,11 +237,9 @@ var cmdRefreshContacts = &commands.FullHandler{
 }
 
 func fnRefreshContacts(ce *WrappedCommandEvent) {
-	ce.Bridge.ZLog.Trace().Interface("args", ce.Args).Str("cmd", ce.Command).Msg("fnSearchContacts")
-
 	err := ce.Bridge.IM.RefreshContactList()
 	if err != nil {
-		ce.Reply("Failed to search contacts: %s", err)
+		ce.Reply("Failed to refresh contacts: %s", err)
 	} else {
 		ce.Reply("Contacts List updated!")
 	}

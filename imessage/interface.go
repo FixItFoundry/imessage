@@ -32,7 +32,8 @@ import (
 )
 
 var (
-	ErrNotLoggedIn = errors.New("you're not logged into iMessage")
+	ErrNotLoggedIn          = errors.New("you're not logged into iMessage")
+	ErrIdentifierResolution = errors.New("identifier resolution failed")
 )
 
 type ContactAPI interface {
@@ -50,6 +51,10 @@ type ChatInfoAPI interface {
 type VenturaFeatures interface {
 	UnsendMessage(chatID, targetGUID string, targetPart int) (*SendResponse, error)
 	EditMessage(chatID, targetGUID string, newText string, targetPart int) (*SendResponse, error)
+}
+
+type GroupChatWithMessageAPI interface {
+	CreateGroupWithMessage(guids []string, message string) (*CreateGroupResponse, error)
 }
 
 type API interface {

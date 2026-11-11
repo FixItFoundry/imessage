@@ -258,6 +258,24 @@ type Portal struct {
 	typingLock   sync.Mutex
 }
 
+func (portal *Portal) roomID() id.RoomID {
+	portal.roomCreateLock.Lock()
+	defer portal.roomCreateLock.Unlock()
+	return portal.MXID
+}
+
+// The caller must hold roomCreateLock.
+func (portal *Portal) updateThreadID(threadID string) error {
+	if threadID == "" || threadID == portal.ThreadID {
+		return nil
+	}
+	if err := portal.Portal.UpdateThreadID(threadID); err != nil {
+		return err
+	}
+	portal.ThreadID = threadID
+	return nil
+}
+
 var (
 	_ bridge.Portal                    = (*Portal)(nil)
 	_ bridge.ReadReceiptHandlingPortal = (*Portal)(nil)
@@ -358,22 +376,26 @@ func (portal *Portal) UpdateName(name string, intent *appservice.IntentAPI) *id.
 }
 
 func (portal *Portal) SyncWithInfo(chatInfo *imessage.ChatInfo) {
-	portal.zlog.Debug().Interface("chat_info", chatInfo).Msg("Syncing with chat info")
+	portal.zlog.Debug().Msg("Syncing with chat info")
+	portal.roomCreateLock.Lock()
 	update := false
 	if chatInfo.ThreadID != "" && chatInfo.ThreadID != portal.ThreadID {
-		portal.log.Infofln("Found portal thread ID in sync: %s (prev: %s)", chatInfo.ThreadID, portal.ThreadID)
-		portal.ThreadID = chatInfo.ThreadID
-		update = true
+		if err := portal.updateThreadID(chatInfo.ThreadID); err != nil {
+			portal.log.Warnln("Failed to persist conversation identity")
+		} else {
+			update = true
+		}
 	}
 	if len(chatInfo.DisplayName) > 0 {
 		update = portal.UpdateName(chatInfo.DisplayName, nil) != nil || update
 	}
-	if !portal.IsPrivateChat() && chatInfo.Members != nil {
-		portal.SyncParticipants(chatInfo)
-	}
 	if update {
 		portal.Update(nil)
 		portal.UpdateBridgeInfo()
+	}
+	portal.roomCreateLock.Unlock()
+	if !portal.IsPrivateChat() && chatInfo.Members != nil {
+		portal.SyncParticipants(chatInfo)
 	}
 }
 
@@ -382,7 +404,7 @@ func (portal *Portal) ensureUserInvited(user *User) {
 }
 
 func (portal *Portal) Sync(backfill bool) {
-	if len(portal.MXID) == 0 {
+	if portal.roomID() == "" {
 		portal.log.Infoln("Creating Matrix room due to sync")
 		err := portal.CreateMatrixRoom(nil, nil)
 		if err != nil {
@@ -407,7 +429,10 @@ func (portal *Portal) Sync(backfill bool) {
 	}
 
 	if !portal.IsPrivateChat() {
-		chatInfo, err := portal.bridge.IM.GetChatInfo(portal.GUID, portal.ThreadID)
+		portal.roomCreateLock.Lock()
+		threadID := portal.ThreadID
+		portal.roomCreateLock.Unlock()
+		chatInfo, err := portal.bridge.IM.GetChatInfo(portal.GUID, threadID)
 		if err != nil {
 			portal.log.Errorln("Failed to get chat info:", err)
 		}
@@ -807,7 +832,15 @@ func (portal *Portal) preCreateDMSync(profileOverride *ProfileOverride) {
 
 func (portal *Portal) CreateMatrixRoom(chatInfo *imessage.ChatInfo, profileOverride *ProfileOverride) error {
 	portal.roomCreateLock.Lock()
-	defer portal.roomCreateLock.Unlock()
+	var createdRoomID id.RoomID
+	defer func() {
+		portal.roomCreateLock.Unlock()
+		if createdRoomID != "" {
+			portal.bridge.portalsLock.Lock()
+			portal.bridge.portalsByMXID[createdRoomID] = portal
+			portal.bridge.portalsLock.Unlock()
+		}
+	}()
 	if len(portal.MXID) > 0 {
 		return nil
 	}
@@ -828,7 +861,9 @@ func (portal *Portal) CreateMatrixRoom(chatInfo *imessage.ChatInfo, profileOverr
 	}
 	if chatInfo != nil {
 		portal.Name = chatInfo.DisplayName
-		portal.ThreadID = chatInfo.ThreadID
+		if err = portal.updateThreadID(chatInfo.ThreadID); err != nil {
+			return fmt.Errorf("failed to persist conversation identity: %w", err)
+		}
 	} else {
 		portal.log.Warnln("Didn't get any chat info")
 	}
@@ -858,11 +893,9 @@ func (portal *Portal) CreateMatrixRoom(chatInfo *imessage.ChatInfo, profileOverr
 		portal.lockBackfill()
 	}
 	portal.MXID = resp.RoomID
+	createdRoomID = resp.RoomID
 	portal.log.Debugln("Storing created room ID", portal.MXID, "in database")
 	portal.Update(nil)
-	portal.bridge.portalsLock.Lock()
-	portal.bridge.portalsByMXID[portal.MXID] = portal
-	portal.bridge.portalsLock.Unlock()
 
 	portal.log.Debugln("Updating state store with initial memberships")
 	inviteeMembership := event.MembershipInvite

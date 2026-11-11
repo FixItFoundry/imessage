@@ -96,13 +96,13 @@ func (imh *iMessageHandler) rerouteGroupMMS(portal *Portal, msg *imessage.Messag
 		!portal.Identifier.IsGroup ||
 		portal.Identifier.Service != "SMS" ||
 		msg.ReplyToGUID == "" ||
-		portal.MXID != "" {
+		portal.roomID() != "" {
 		return portal
 	}
 	mergedChatGUID := imh.bridge.DB.MergedChat.Get(portal.GUID)
 	if mergedChatGUID != "" && mergedChatGUID != portal.GUID {
 		newPortal := imh.bridge.GetPortalByGUID(mergedChatGUID)
-		if newPortal.MXID != "" {
+		if newPortal.roomID() != "" {
 			imh.log.Debugfln("Rerouted %s from %s to %s based on merged_chat table", msg.GUID, msg.ChatGUID, portal.GUID)
 			return newPortal
 		}
@@ -121,7 +121,7 @@ func (imh *iMessageHandler) rerouteGroupMMS(portal *Portal, msg *imessage.Messag
 		chatGUID := imh.bridge.DB.Message.FindChatByGUID(replyMsg.ReplyToGUID)
 		if chatGUID != "" && !isCheckedGUID(chatGUID) {
 			newPortal := imh.bridge.GetPortalByGUID(chatGUID)
-			if newPortal.MXID != "" {
+			if newPortal.roomID() != "" {
 				imh.log.Debugfln("Rerouted %s from %s to %s based on reply metadata (found reply in local db)", msg.GUID, msg.ChatGUID, portal.GUID)
 				imh.log.Debugfln("Merging %+v -> %s", checkedChatGUIDs, newPortal.GUID)
 				imh.bridge.DB.MergedChat.Set(nil, newPortal.GUID, checkedChatGUIDs...)
@@ -137,7 +137,7 @@ func (imh *iMessageHandler) rerouteGroupMMS(portal *Portal, msg *imessage.Messag
 		}
 		if !isCheckedGUID(replyMsg.ChatGUID) {
 			newPortal := imh.bridge.GetPortalByGUID(chatGUID)
-			if newPortal.MXID != "" {
+			if newPortal.roomID() != "" {
 				imh.log.Debugfln("Rerouted %s from %s to %s based on reply metadata (got reply msg from connector)", msg.GUID, msg.ChatGUID, portal.GUID)
 				imh.log.Debugfln("Merging %+v -> %s", checkedChatGUIDs, newPortal.GUID)
 				imh.bridge.DB.MergedChat.Set(nil, newPortal.GUID, checkedChatGUIDs...)
@@ -151,7 +151,7 @@ func (imh *iMessageHandler) rerouteGroupMMS(portal *Portal, msg *imessage.Messag
 }
 
 func (imh *iMessageHandler) updateChatGUIDByThreadID(portal *Portal, threadID string) *Portal {
-	if len(portal.MXID) > 0 || !portal.Identifier.IsGroup || threadID == "" || portal.bridge.Config.IMessage.Platform == "android" {
+	if portal.roomID() != "" || !portal.Identifier.IsGroup || threadID == "" || portal.bridge.Config.IMessage.Platform == "android" {
 		return portal
 	}
 	existingByThreadID := imh.bridge.FindPortalsByThreadID(threadID)
@@ -159,7 +159,9 @@ func (imh *iMessageHandler) updateChatGUIDByThreadID(portal *Portal, threadID st
 		imh.log.Warnfln("Found multiple portals with thread ID %s (message chat guid: %s)", threadID, portal.GUID)
 	} else if len(existingByThreadID) == 0 {
 		// no need to log, this is just an ordinary new group
-	} else if existingByThreadID[0].MXID != "" {
+	} else if existingByThreadID[0] == portal {
+		return portal
+	} else if existingByThreadID[0].roomID() != "" {
 		imh.log.Infofln("Found existing portal %s for thread ID %s, merging %s into it", existingByThreadID[0].GUID, threadID, portal.GUID)
 		existingByThreadID[0].reIDInto(portal.GUID, portal, true, false)
 		return existingByThreadID[0]
@@ -175,7 +177,7 @@ func (imh *iMessageHandler) getPortalFromMessage(msg *imessage.Message) *Portal 
 }
 
 func (imh *iMessageHandler) HandleMessage(msg *imessage.Message) {
-	imh.log.Debugfln("Received incoming message %s in %s (%s)", msg.GUID, msg.ChatGUID, msg.ThreadID)
+	imh.log.Debugln("Received incoming message")
 	// TODO trace log
 	//imh.log.Debugfln("Received incoming message: %+v", msg)
 	portal := imh.updateChatGUIDByThreadID(
@@ -185,15 +187,17 @@ func (imh *iMessageHandler) HandleMessage(msg *imessage.Message) {
 		),
 		msg.ThreadID,
 	)
+	portal.roomCreateLock.Lock()
 	if msg.ThreadID != "" && msg.ThreadID != portal.ThreadID {
-		portal.log.Infoln("Found portal thread ID in message: %s (prev: %s)", msg.ThreadID, portal.ThreadID)
-		portal.ThreadID = msg.ThreadID
-		if len(portal.MXID) > 0 {
-			portal.Update(nil)
+		if err := portal.updateThreadID(msg.ThreadID); err != nil {
+			portal.log.Warnln("Failed to persist conversation identity")
+		} else if portal.MXID != "" {
 			portal.UpdateBridgeInfo()
 		}
 	}
-	if len(portal.MXID) == 0 {
+	roomID := portal.MXID
+	portal.roomCreateLock.Unlock()
+	if roomID == "" {
 		portal.log.Infoln("Creating Matrix room to handle message")
 		err := portal.CreateMatrixRoom(nil, nil)
 		if err != nil {
@@ -210,7 +214,7 @@ func (imh *iMessageHandler) HandleMessage(msg *imessage.Message) {
 
 func (imh *iMessageHandler) HandleMessageStatus(status *imessage.SendMessageStatus) {
 	portal := imh.bridge.GetPortalByGUID(status.ChatGUID)
-	if len(portal.MXID) == 0 {
+	if portal.roomID() == "" {
 		imh.log.Debugfln("Ignoring message status for message from unknown portal %s/%s", status.GUID, status.ChatGUID)
 		return
 	}
@@ -223,7 +227,7 @@ func (imh *iMessageHandler) HandleMessageStatus(status *imessage.SendMessageStat
 
 func (imh *iMessageHandler) HandleReadReceipt(rr *imessage.ReadReceipt) {
 	portal := imh.bridge.GetPortalByGUID(rr.ChatGUID)
-	if len(portal.MXID) == 0 {
+	if portal.roomID() == "" {
 		imh.log.Debugfln("Ignoring read receipt in unknown portal %s", rr.ChatGUID)
 		return
 	}
@@ -236,16 +240,17 @@ func (imh *iMessageHandler) HandleReadReceipt(rr *imessage.ReadReceipt) {
 
 func (imh *iMessageHandler) HandleTypingNotification(notif *imessage.TypingNotification) {
 	portal := imh.bridge.GetPortalByGUID(notif.ChatGUID)
-	if len(portal.MXID) == 0 {
+	roomID := portal.roomID()
+	if roomID == "" {
 		return
 	}
-	_, err := portal.MainIntent().UserTyping(portal.MXID, notif.Typing, 60*time.Second)
+	_, err := portal.MainIntent().UserTyping(roomID, notif.Typing, 60*time.Second)
 	if err != nil {
 		action := "typing"
 		if !notif.Typing {
 			action = "not typing"
 		}
-		portal.log.Warnln("Failed to mark %s as %s in %s: %v", portal.MainIntent().UserID, action, portal.MXID, err)
+		portal.log.Warnln("Failed to mark %s as %s in %s: %v", portal.MainIntent().UserID, action, roomID, err)
 	}
 }
 
@@ -265,7 +270,7 @@ func (imh *iMessageHandler) HandleChat(chat *imessage.ChatInfo) {
 	}
 	portal := imh.bridge.GetPortalByGUID(chat.Identifier.String())
 	portal = imh.updateChatGUIDByThreadID(portal, chat.ThreadID)
-	if len(portal.MXID) > 0 {
+	if portal.roomID() != "" {
 		portal.log.Infoln("Syncing Matrix room to handle chat command")
 		portal.SyncWithInfo(chat)
 	} else if !chat.NoCreateRoom {
@@ -285,7 +290,7 @@ func (imh *iMessageHandler) HandleBackfillTask(task *imessage.BackfillTask) {
 		return
 	}
 	portal := imh.bridge.GetPortalByGUID(task.ChatGUID)
-	if len(portal.MXID) == 0 {
+	if portal.roomID() == "" {
 		portal.log.Errorfln("Tried to backfill chat %s with no portal", portal.GUID)
 		imh.bridge.IM.SendBackfillResult(portal.GUID, task.BackfillID, false, nil)
 		return

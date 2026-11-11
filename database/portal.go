@@ -180,6 +180,11 @@ func (portal *Portal) Update(txn dbutil.Execable) {
 	}
 }
 
+func (portal *Portal) UpdateThreadID(threadID string) error {
+	_, err := portal.db.Exec("UPDATE portal SET thread_id=$1 WHERE guid=$2", threadID, portal.GUID)
+	return err
+}
+
 func (portal *Portal) ReID(newGUID string) {
 	_, err := portal.db.Exec("UPDATE portal SET guid=$1 WHERE guid=$2", newGUID, portal.GUID)
 	if err != nil {
