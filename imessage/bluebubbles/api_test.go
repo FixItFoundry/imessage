@@ -530,7 +530,7 @@ func TestRecipientAndGroupSizeBoundaries(t *testing.T) {
 
 func TestIncomingMissingOrInvalidChat(t *testing.T) {
 	bb := &blueBubbles{log: zerolog.New(io.Discard)}
-	for _, chats := range [][]Chat{nil, {{GUID: "malformed"}}, {{GUID: "iMessage;+;"}}, {{GUID: "iMessage;+;synthetic"}, {GUID: "SMS;+;synthetic"}}} {
+	for _, chats := range [][]Chat{nil, {{GUID: "malformed"}}, {{GUID: "iMessage;+;"}}, {{GUID: "malformed"}, {GUID: "SMS;+;synthetic"}}} {
 		if _, err := bb.convertBBMessageToiMessage(Message{Chats: chats}); err == nil {
 			t.Fatal("missing or invalid chat was accepted")
 		}
@@ -540,6 +540,32 @@ func TestIncomingMissingOrInvalidChat(t *testing.T) {
 	}
 	if _, err := bb.convertBBChatToiMessageChat(Chat{GUID: "malformed"}); err == nil {
 		t.Fatal("malformed chat must not reach ParseIdentifier")
+	}
+}
+
+func TestIncomingMultipleChatsPreservesFirstChat(t *testing.T) {
+	bb := &blueBubbles{}
+	for _, service := range []string{"iMessage", "SMS"} {
+		t.Run(service, func(t *testing.T) {
+			otherService := "SMS"
+			if service == "SMS" {
+				otherService = "iMessage"
+			}
+			input := Message{
+				GUID: "synthetic-message", Text: "synthetic body", ThreadOriginatorGUID: "synthetic-reply",
+				Chats: []Chat{
+					{GUID: service + ";-;+12025550101", GroupID: "first-thread"},
+					{GUID: otherService + ";-;+12025550101", GroupID: "second-thread"},
+				},
+			}
+			got, err := bb.convertBBMessageToiMessage(input)
+			if err != nil {
+				t.Fatalf("message linked to multiple chats was rejected: %v", err)
+			}
+			if got.GUID != input.GUID || got.Text != input.Text || got.ChatGUID != input.Chats[0].GUID || got.ThreadID != input.Chats[0].GroupID || got.ReplyToGUID != input.ThreadOriginatorGUID {
+				t.Fatal("message content or first-chat identity changed")
+			}
+		})
 	}
 }
 

@@ -1799,7 +1799,7 @@ func (bb *blueBubbles) convertBBContactToiMessageContact(bbContact *Contact) (*i
 }
 
 func (bb *blueBubbles) convertBBMessageToiMessage(bbMessage Message) (*imessage.Message, error) {
-	if len(bbMessage.Chats) != 1 || !validChatGUID(bbMessage.Chats[0].GUID, false) {
+	if len(bbMessage.Chats) == 0 || !validChatGUID(bbMessage.Chats[0].GUID, false) {
 		return nil, errors.New("message is missing a valid containing chat")
 	}
 
