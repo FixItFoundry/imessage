@@ -74,6 +74,7 @@ type IMBridge struct {
 	IPC       *ipc.Processor
 
 	WebsocketHandler *WebsocketCommandHandler
+	provisioning     *provisioningAPI
 
 	user          *User
 	portalsByMXID map[id.RoomID]*Portal
@@ -228,6 +229,7 @@ func (br *IMBridge) Init() {
 
 	br.IMHandler = NewiMessageHandler(br)
 	br.WebsocketHandler = NewWebsocketCommandHandler(br)
+	br.initProvisioning()
 	br.wsOnConnectWait.Add(1)
 
 	br.CommandProcessor = commands.NewProcessor(&br.Bridge)
@@ -539,6 +541,9 @@ func (br *IMBridge) Start() {
 	go br.IMHandler.Start()
 	br.wsOnConnectWait.Done()
 	startupGroup.Wait()
+	if br.provisioning != nil {
+		br.provisioning.markReady()
+	}
 	br.WaitWebsocketConnected()
 	br.Log.Debugln("Starting IPC loop")
 	go br.IPC.Loop()
@@ -657,6 +662,9 @@ func (br *IMBridge) ipcStop(_ json.RawMessage) interface{} {
 }
 
 func (br *IMBridge) Stop() {
+	if br.provisioning != nil {
+		br.provisioning.state.Store(&provisioningState{Timestamp: time.Now().Unix(), Stopping: true})
+	}
 	br.ZLog.Debug().Msg("Stopping iMessage connector")
 	if br.Config.Bridge.Backfill.OnlyBackfill {
 		return

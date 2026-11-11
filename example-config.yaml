@@ -1,3 +1,7 @@
+# Native provisioning for BlueBubbles. Use a separate secret of at least 16 characters.
+provisioning:
+    shared_secret: disable
+
 # Homeserver details.
 homeserver:
     # The address that this appservice can use to connect to the homeserver.

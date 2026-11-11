@@ -30,9 +30,12 @@ type SegmentConfig struct {
 type Config struct {
 	*bridgeconfig.BaseConfig `yaml:",inline"`
 
-	IMessage imessage.PlatformConfig `yaml:"imessage"`
-	Segment  SegmentConfig           `yaml:"segment"`
-	Bridge   BridgeConfig            `yaml:"bridge"`
+	IMessage     imessage.PlatformConfig `yaml:"imessage"`
+	Segment      SegmentConfig           `yaml:"segment"`
+	Bridge       BridgeConfig            `yaml:"bridge"`
+	Provisioning struct {
+		SharedSecret string `yaml:"shared_secret"`
+	} `yaml:"provisioning"`
 
 	HackyStartupTest struct {
 		Identifier      string `yaml:"identifier"`

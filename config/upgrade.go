@@ -28,6 +28,7 @@ func DoUpgrade(helper *up.Helper) {
 	bridgeconfig.Upgrader.DoUpgrade(helper)
 
 	helper.Copy(up.Int, "revision")
+	helper.Copy(up.Str, "provisioning", "shared_secret")
 
 	helper.Copy(up.Str, "imessage", "platform")
 	helper.Copy(up.Str, "imessage", "imessage_rest_path")
@@ -162,6 +163,7 @@ var SpacedBlocks = [][]string{
 	{"appservice", "id"},
 	{"appservice", "as_token"},
 	{"imessage"},
+	{"provisioning"},
 	{"bridge"},
 	{"bridge", "username_template"},
 	{"bridge", "delivery_receipts"},

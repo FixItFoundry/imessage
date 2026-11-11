@@ -469,7 +469,7 @@ func (mx *WebsocketCommandHandler) StartChat(req StartDMRequest) (*StartDMRespon
 	if parsed := imessage.ParseIdentifier(resp.GUID); parsed.Service == "SMS" && !isNumber(parsed.LocalID) {
 		mx.trackResolveIdentifier(!req.ActuallyStart, req.Identifier, "fail")
 		return nil, fmt.Errorf("can't start SMS with non-numeric identifier")
-	} else if portal := mx.bridge.GetPortalByGUID(resp.GUID); len(portal.MXID) > 0 || !req.ActuallyStart {
+	} else if portal := mx.bridge.GetPortalByGUID(resp.GUID); portal.roomID() != "" || !req.ActuallyStart {
 		status := "success"
 		if parsed.Service == "SMS" {
 			status = "sms"
@@ -477,7 +477,7 @@ func (mx *WebsocketCommandHandler) StartChat(req StartDMRequest) (*StartDMRespon
 		if !forced {
 			mx.trackResolveIdentifier(!req.ActuallyStart, req.Identifier, status)
 		}
-		resp.RoomID = portal.MXID
+		resp.RoomID = portal.roomID()
 		return &resp, nil
 	} else if err = mx.bridge.IM.PrepareDM(resp.GUID); err != nil {
 		return nil, fmt.Errorf("failed to prepare DM: %w", err)
@@ -485,7 +485,7 @@ func (mx *WebsocketCommandHandler) StartChat(req StartDMRequest) (*StartDMRespon
 		return nil, fmt.Errorf("failed to create Matrix room: %w", err)
 	} else {
 		resp.JustCreated = true
-		resp.RoomID = portal.MXID
+		resp.RoomID = portal.roomID()
 		return &resp, nil
 	}
 }

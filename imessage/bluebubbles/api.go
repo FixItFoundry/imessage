@@ -1411,7 +1411,8 @@ func (bb *blueBubbles) ResolveIdentifier(address string) (string, error) {
 	return guid, nil
 }
 
-func normalizeRecipient(input string) (service, address string, err error) {
+// NormalizeRecipient validates an address without network requests or country guessing.
+func NormalizeRecipient(input string) (service, address string, err error) {
 	for _, r := range input {
 		if unicode.IsControl(r) {
 			return "", "", errors.New("recipient must not contain control characters")
@@ -1462,7 +1463,7 @@ func normalizeRecipient(input string) (service, address string, err error) {
 }
 
 func (bb *blueBubbles) resolveIdentifier(input string) (string, error) {
-	service, address, err := normalizeRecipient(input)
+	service, address, err := NormalizeRecipient(input)
 	if err != nil {
 		return "", err
 	}
@@ -1495,7 +1496,7 @@ func (bb *blueBubbles) resolveIdentifier(input string) (string, error) {
 	if err := bb.doJSONRequest(req, &response); err != nil {
 		return "", fmt.Errorf("could not resolve stored recipient; enable Private API for live iMessage lookup: %w", err)
 	}
-	storedService, storedAddress, err := normalizeRecipient(response.Data.Service + ";-;" + response.Data.Address)
+	storedService, storedAddress, err := NormalizeRecipient(response.Data.Service + ";-;" + response.Data.Address)
 	if err != nil || storedAddress != address || (service != "" && storedService != service) {
 		return "", errors.New("stored recipient identity is invalid or unresolved; enable Private API for live iMessage lookup")
 	}
@@ -1524,7 +1525,7 @@ func (bb *blueBubbles) CreateGroupWithMessage(guids []string, message string) (*
 	request := CreateChatRequest{Message: message, Method: "private-api", Service: "iMessage"}
 	seen := make(map[string]bool, len(guids))
 	for _, guid := range guids {
-		service, address, err := normalizeRecipient(guid)
+		service, address, err := NormalizeRecipient(guid)
 		if err != nil || service == "" || service == "RCS" {
 			return nil, errors.New("group participants must be direct iMessage or SMS identifiers, not RCS")
 		}

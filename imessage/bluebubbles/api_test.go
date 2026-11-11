@@ -224,7 +224,7 @@ func TestResolveLiveAvailability(t *testing.T) {
 				if r.Method != http.MethodGet || r.URL.Path != "/api/v1/handle/availability/imessage" {
 					t.Error("lookup must use only the availability GET endpoint")
 				}
-				_, address, err := normalizeRecipient(tc.input)
+				_, address, err := NormalizeRecipient(tc.input)
 				if err != nil || r.URL.Query().Get("address") != address || r.URL.Query().Get("password") != "synthetic-secret&+?" {
 					t.Error("availability query normalization/authentication changed")
 				}
@@ -284,7 +284,7 @@ func TestResolveStoredIdentity(t *testing.T) {
 	} {
 		t.Run(tc.input+tc.storedService+tc.storedAddress, func(t *testing.T) {
 			bb := testConnector(t, func(w http.ResponseWriter, r *http.Request) {
-				_, address, _ := normalizeRecipient(tc.input)
+				_, address, _ := NormalizeRecipient(tc.input)
 				if r.Method != "GET" || r.URL.EscapedPath() != "/api/v1/handle/"+url.PathEscape(address) {
 					t.Error("stored handle path was not correctly escaped")
 				}
@@ -505,7 +505,7 @@ func TestGroupCreationDoesNotFollowRedirect(t *testing.T) {
 
 func TestRecipientAndGroupSizeBoundaries(t *testing.T) {
 	for _, address := range []string{"+1234567", "+123456789012345"} {
-		if _, got, err := normalizeRecipient(address); err != nil || got != address {
+		if _, got, err := NormalizeRecipient(address); err != nil || got != address {
 			t.Fatal("valid international number boundary was rejected")
 		}
 	}
